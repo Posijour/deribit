@@ -271,10 +271,25 @@ def main():
                 out = compute_vbi(c)
                 if out:
                     send_to_db(EVENT_NAME, out)
-            except Exception:
-                pass
+            except Exception as e:
+                send_to_db(
+                    "deribit_vbi_error",
+                    {
+                        "ts_unix_ms": now_ts_ms(),
+                        "symbol": c,
+                        "error": str(e)
+                    }
+                )
+
+        # HEARTBEAT — ВСЕГДА
+        send_to_db(
+            "deribit_vbi_heartbeat",
+            {
+                "ts_unix_ms": now_ts_ms(),
+                "symbol": "SYSTEM",
+                "status": "alive"
+            }
+        )
 
         time.sleep(CHECK_INTERVAL)
 
-if __name__ == "__main__":
-    main()
