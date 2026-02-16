@@ -15,6 +15,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PORT = int(os.environ.get("PORT", "10000"))
 ENV  = os.environ.get("ENV", "render")
 
+SERVICE_URL = os.environ.get("SERVICE_URL")  # https://xxx.onrender.com
+
 # ===================== CONFIG =====================
 
 BASE_URL = "https://www.deribit.com/api/v2"
@@ -22,6 +24,7 @@ BASE_URL = "https://www.deribit.com/api/v2"
 CURRENCIES = ["BTC", "ETH"]   # SOL УБРАН
 
 CHECK_INTERVAL = 600  # 10 min
+PING_INTERVAL  = 300  # 5 min
 
 EVENT_NAME = "deribit_vbi_snapshot"
 
@@ -77,21 +80,38 @@ def send_to_db(event, payload):
             timeout=5
         )
     except Exception:
-        pass  # stdout намеренно не используем
+        pass
 
 # ===================== HTTP (HEALTH) =====================
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path in ["/", "/ping"]:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, *_):
         pass
 
 def run_http_server():
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
+
+# ===================== RENDER KEEP-ALIVE =====================
+
+def keep_alive_ping():
+    if ENV != "render" or not SERVICE_URL:
+        return
+
+    while True:
+        try:
+            requests.get(f"{SERVICE_URL}/ping", timeout=10)
+        except Exception:
+            pass
+        time.sleep(PING_INTERVAL)
 
 # ===================== DERIBIT API =====================
 
@@ -190,9 +210,7 @@ def compute_vbi(currency):
 
     skew = np["mark_iv"] / nc["mark_iv"] if nc["mark_iv"] else None
 
-    # ===== SCORE =====
     score = 0
-
     if iv_slope > IV_SLOPE_MEDIUM:
         score += 40
     if iv_slope > IV_SLOPE_STRONG:
@@ -213,7 +231,6 @@ def compute_vbi(currency):
 
     score = max(0, min(score, 100))
 
-    # ===== STATE =====
     if score < 30:
         vbi_state = "COLD"
     elif score <= 60:
@@ -221,20 +238,17 @@ def compute_vbi(currency):
     else:
         vbi_state = "HOT"
 
-    # ===== PATTERN =====
     vbi_pattern = "NEUTRAL"
-
     if len(iv_slope_hist[currency]) >= 3:
         s = iv_slope_hist[currency]
         n = near_iv_hist[currency]
 
-        pre_break_core = (
+        if (
             s[0] < s[1] < s[2] and
             max(n) - min(n) < NEAR_IV_STABILITY * near_iv and
-            abs(skew - 1.0) < SKEW_NEUTRAL_BAND
-        )
-
-        if pre_break_core and curvature > 0:
+            abs(skew - 1.0) < SKEW_NEUTRAL_BAND and
+            curvature > 0
+        ):
             vbi_pattern = "PRE_BREAK"
 
         if iv_slope < -2.0 and curvature < 0 and near_iv < n[-2]:
@@ -243,20 +257,15 @@ def compute_vbi(currency):
     return {
         "ts_unix_ms": now_ts_ms(),
         "ts_iso_utc": now_iso_utc(),
-
         "symbol": currency,
-
         "vbi_state": vbi_state,
         "vbi_score": score,
-
         "near_iv": round(near_iv, 2),
         "mid_iv": round(mid_iv, 2),
         "far_iv": round(far_iv, 2),
-
         "iv_slope": round(iv_slope, 2),
         "curvature": round(curvature, 2),
         "skew": round(skew, 3) if skew else None,
-
         "vbi_pattern": vbi_pattern
     }
 
@@ -264,6 +273,7 @@ def compute_vbi(currency):
 
 def main():
     threading.Thread(target=run_http_server, daemon=True).start()
+    threading.Thread(target=keep_alive_ping, daemon=True).start()
 
     while True:
         for c in CURRENCIES:
@@ -281,7 +291,6 @@ def main():
                     }
                 )
 
-        # HEARTBEAT — ВСЕГДА
         send_to_db(
             "deribit_vbi_heartbeat",
             {
@@ -292,6 +301,6 @@ def main():
         )
 
         time.sleep(CHECK_INTERVAL)
-        
+
 if __name__ == "__main__":
     main()
