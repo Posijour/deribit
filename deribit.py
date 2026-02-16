@@ -292,4 +292,6 @@ def main():
         )
 
         time.sleep(CHECK_INTERVAL)
-
+        
+if __name__ == "__main__":
+    main()
