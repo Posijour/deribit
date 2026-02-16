@@ -15,8 +15,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PORT = int(os.environ.get("PORT", "10000"))
 ENV  = os.environ.get("ENV", "render")
 
-SERVICE_URL = os.environ.get("SERVICE_URL")  # https://xxx.onrender.com
-
 # ===================== CONFIG =====================
 
 BASE_URL = "https://www.deribit.com/api/v2"
@@ -24,7 +22,6 @@ BASE_URL = "https://www.deribit.com/api/v2"
 CURRENCIES = ["BTC", "ETH"]   # SOL УБРАН
 
 CHECK_INTERVAL = 600  # 10 min
-PING_INTERVAL  = 300  # 5 min
 
 EVENT_NAME = "deribit_vbi_snapshot"
 
@@ -86,32 +83,21 @@ def send_to_db(event, payload):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ["/", "/ping"]:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-    def log_message(self, *_):
-        pass
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
 
 def run_http_server():
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
-
-# ===================== RENDER KEEP-ALIVE =====================
-
-def keep_alive_ping():
-    if ENV != "render" or not SERVICE_URL:
-        return
-
-    while True:
-        try:
-            requests.get(f"{SERVICE_URL}/ping", timeout=10)
-        except Exception:
-            pass
-        time.sleep(PING_INTERVAL)
 
 # ===================== DERIBIT API =====================
 
@@ -273,8 +259,7 @@ def compute_vbi(currency):
 
 def main():
     threading.Thread(target=run_http_server, daemon=True).start()
-    threading.Thread(target=keep_alive_ping, daemon=True).start()
-
+    
     while True:
         for c in CURRENCIES:
             try:
