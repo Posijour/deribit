@@ -86,7 +86,7 @@ def send_to_db(event, payload):
             },
             timeout=5
         )
-    r.raise_for_status()
+        r.raise_for_status()
     except Exception as e:
         logger.warning("Failed to write event %s to DB: %s", event, e)
 
