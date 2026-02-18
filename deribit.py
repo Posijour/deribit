@@ -2,6 +2,8 @@ import requests
 import time
 import math
 import threading
+import random
+import logging
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,6 +16,13 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 PORT = int(os.environ.get("PORT", "10000"))
 ENV  = os.environ.get("ENV", "render")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger("deribit_vbi")
+
 
 # ===================== CONFIG =====================
 
@@ -56,11 +65,12 @@ def _sanitize_for_json(value):
 
 def send_to_db(event, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.debug("Skipping DB write for %s: SUPABASE env vars are not set", event)
         return
 
     try:
         safe_payload = _sanitize_for_json(payload)
-        requests.post(
+        r = requests.post(
             f"{SUPABASE_URL}/rest/v1/logs",
             headers={
                 "apikey": SUPABASE_KEY,
@@ -76,8 +86,9 @@ def send_to_db(event, payload):
             },
             timeout=5
         )
-    except Exception:
-        pass
+    r.raise_for_status()
+    except Exception as e:
+        logger.warning("Failed to write event %s to DB: %s", event, e)
 
 # ===================== HTTP (HEALTH) =====================
 
@@ -109,6 +120,7 @@ def get_json(method, params=None, retries=3):
     for attempt in range(retries):
         try:
             r = session.get(url, params=params, timeout=15)
+            r.raise_for_status()
             j = r.json()
             if "error" in j:
                 raise Exception(j["error"])
@@ -116,7 +128,8 @@ def get_json(method, params=None, retries=3):
         except Exception:
             if attempt == retries - 1:
                 raise
-            time.sleep(1.5)
+            backoff = (1.5 * (2 ** attempt)) + random.uniform(0, 0.5)
+            time.sleep(backoff)
 
 def get_index_price(currency):
     return get_json(
@@ -232,6 +245,7 @@ def compute_vbi(currency):
         if (
             s[0] < s[1] < s[2] and
             max(n) - min(n) < NEAR_IV_STABILITY * near_iv and
+            skew is not None and
             abs(skew - 1.0) < SKEW_NEUTRAL_BAND and
             curvature > 0
         ):
@@ -259,6 +273,9 @@ def compute_vbi(currency):
 
 def main():
     threading.Thread(target=run_http_server, daemon=True).start()
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.info("SUPABASE_URL/SUPABASE_KEY are not set; running in no-persist mode")
+    logger.info("Starting bot for currencies=%s interval=%ss", CURRENCIES, CHECK_INTERVAL)
     
     while True:
         for c in CURRENCIES:
@@ -267,6 +284,7 @@ def main():
                 if out:
                     send_to_db(EVENT_NAME, out)
             except Exception as e:
+                logger.exception("Failed cycle for %s: %s", c, e)
                 send_to_db(
                     "deribit_vbi_error",
                     {
