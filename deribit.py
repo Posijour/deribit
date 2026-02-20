@@ -23,12 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("deribit_vbi")
 
-
 # ===================== CONFIG =====================
 
 BASE_URL = "https://www.deribit.com/api/v2"
 
-CURRENCIES = ["BTC", "ETH"]   # SOL УБРАН
+CURRENCIES = ["BTC", "ETH"]
 
 CHECK_INTERVAL = 600  # 10 min
 
@@ -44,6 +43,11 @@ SKEW_EXTREME_BAND = 0.15
 PATTERN_WINDOW = 3
 NEAR_IV_STABILITY = 0.02
 
+# --- ROLLING MATURITY WINDOWS (DAYS) ---
+NEAR_DTE_RANGE = (5, 10)
+MID_DTE_RANGE  = (20, 35)
+FAR_DTE_RANGE  = (60, 90)
+
 # ===================== TIME =====================
 
 def now_ts_ms():
@@ -51,6 +55,9 @@ def now_ts_ms():
 
 def now_iso_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def dte_days(exp_ts):
+    return (exp_ts - now_ts_ms()) / (1000 * 60 * 60 * 24)
 
 # ===================== SUPABASE =====================
 
@@ -65,7 +72,6 @@ def _sanitize_for_json(value):
 
 def send_to_db(event, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.debug("Skipping DB write for %s: SUPABASE env vars are not set", event)
         return
 
     try:
@@ -87,8 +93,8 @@ def send_to_db(event, payload):
             timeout=5
         )
         r.raise_for_status()
-    except Exception as e:
-        logger.warning("Failed to write event %s to DB: %s", event, e)
+    except Exception:
+        pass
 
 # ===================== HTTP (HEALTH) =====================
 
@@ -104,7 +110,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
 
-    def log_message(self, format, *args):
+    def log_message(self, *_):
         return
 
 def run_http_server():
@@ -128,8 +134,7 @@ def get_json(method, params=None, retries=3):
         except Exception:
             if attempt == retries - 1:
                 raise
-            backoff = (1.5 * (2 ** attempt)) + random.uniform(0, 0.5)
-            time.sleep(backoff)
+            time.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
 
 def get_index_price(currency):
     return get_json(
@@ -156,9 +161,29 @@ def get_book(instr):
 
 # ===================== OPTION HELPERS =====================
 
-def pick_three_expiries(options):
-    exps = sorted({o["expiration_timestamp"] for o in options})
-    return exps[:3] if len(exps) >= 3 else (None, None, None)
+def pick_rolling_expiries(options):
+    buckets = {"near": [], "mid": [], "far": []}
+
+    for o in options:
+        dte = dte_days(o["expiration_timestamp"])
+        if NEAR_DTE_RANGE[0] <= dte <= NEAR_DTE_RANGE[1]:
+            buckets["near"].append(o["expiration_timestamp"])
+        elif MID_DTE_RANGE[0] <= dte <= MID_DTE_RANGE[1]:
+            buckets["mid"].append(o["expiration_timestamp"])
+        elif FAR_DTE_RANGE[0] <= dte <= FAR_DTE_RANGE[1]:
+            buckets["far"].append(o["expiration_timestamp"])
+
+    def pick(ts_list, target):
+        if not ts_list:
+            return None
+        mid = sum(target) / 2
+        return min(ts_list, key=lambda ts: abs(dte_days(ts) - mid))
+
+    return (
+        pick(buckets["near"], NEAR_DTE_RANGE),
+        pick(buckets["mid"],  MID_DTE_RANGE),
+        pick(buckets["far"],  FAR_DTE_RANGE),
+    )
 
 def atm_option(options, exp, opt_type, spot):
     cands = [
@@ -178,7 +203,7 @@ def compute_vbi(currency):
     options = get_options(currency)
     spot = get_index_price(currency)
 
-    exp1, exp2, exp3 = pick_three_expiries(options)
+    exp1, exp2, exp3 = pick_rolling_expiries(options)
     if not exp1 or not exp2 or not exp3:
         return None
 
@@ -273,26 +298,16 @@ def compute_vbi(currency):
 
 def main():
     threading.Thread(target=run_http_server, daemon=True).start()
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.info("SUPABASE_URL/SUPABASE_KEY are not set; running in no-persist mode")
-    logger.info("Starting bot for currencies=%s interval=%ss", CURRENCIES, CHECK_INTERVAL)
-    
+    logger.info("Starting Deribit VBI with rolling maturity")
+
     while True:
         for c in CURRENCIES:
             try:
                 out = compute_vbi(c)
                 if out:
                     send_to_db(EVENT_NAME, out)
-            except Exception as e:
-                logger.exception("Failed cycle for %s: %s", c, e)
-                send_to_db(
-                    "deribit_vbi_error",
-                    {
-                        "ts_unix_ms": now_ts_ms(),
-                        "symbol": c,
-                        "error": str(e)
-                    }
-                )
+            except Exception:
+                pass
 
         send_to_db(
             "deribit_vbi_heartbeat",
