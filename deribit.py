@@ -262,6 +262,13 @@ def compute_vbi(currency):
 
         skew = np["mark_iv"] / nc["mark_iv"] if nc["mark_iv"] else None
 
+        logger.info(
+            f"{currency}: near_iv={near_iv:.4f} "
+            f"mid_iv={mid_iv:.4f} "
+            f"far_iv={far_iv:.4f} "
+            f"iv_slope={iv_slope:.4f} "
+            f"skew={skew}"
+        )
         score = 0
         if iv_slope > IV_SLOPE_MEDIUM:
             score += 40
