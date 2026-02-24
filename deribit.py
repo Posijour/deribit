@@ -72,6 +72,7 @@ def _sanitize_for_json(value):
 
 def send_to_db(event, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("Supabase ENV not set, skipping send")
         return
 
     try:
@@ -93,6 +94,7 @@ def send_to_db(event, payload):
             timeout=5
         )
         r.raise_for_status()
+        logger.info(f"Supabase OK → event={event} symbol={safe_payload['symbol']}")
     except Exception:
         logger.exception("Supabase insert failed")
 
@@ -114,6 +116,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 def run_http_server():
+    logger.info(f"HTTP health server listening on {PORT}")
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 # ===================== DERIBIT API =====================
@@ -131,9 +134,10 @@ def get_json(method, params=None, retries=3):
             if "error" in j:
                 raise Exception(j["error"])
             return j["result"]
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
                 raise
+            logger.warning(f"Deribit retry {attempt+1} for {method}: {e}")
             time.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
 
 def get_index_price(currency):
@@ -200,7 +204,7 @@ near_iv_hist  = {s: deque(maxlen=PATTERN_WINDOW) for s in CURRENCIES}
 # ===================== VBI CORE =====================
 
 def degraded(currency, reason):
-    logger.warning(f"{currency}: degraded – {reason}")
+    logger.warning(f"{currency}: DEGRADED ({reason})")
     return {
         "ts_unix_ms": now_ts_ms(),
         "ts_iso_utc": now_iso_utc(),
@@ -212,6 +216,8 @@ def degraded(currency, reason):
     }
 
 def compute_vbi(currency):
+    logger.info(f"{currency}: compute start")
+
     try:
         options = get_options(currency)
         spot = get_index_price(currency)
@@ -270,8 +276,9 @@ def compute_vbi(currency):
                 score -= 10
 
         score = max(0, min(score, 100))
-
         vbi_state = "COLD" if score < 30 else "WARM" if score <= 60 else "HOT"
+
+        logger.info(f"{currency}: compute OK state={vbi_state} score={score}")
 
         return {
             "ts_unix_ms": now_ts_ms(),
@@ -296,9 +303,11 @@ def compute_vbi(currency):
 
 def main():
     threading.Thread(target=run_http_server, daemon=True).start()
-    logger.info("Starting Deribit VBI with rolling maturity")
+    logger.info("Starting Deribit VBI service")
 
     while True:
+        logger.info("=== VBI cycle start ===")
+
         for c in CURRENCIES:
             out = compute_vbi(c)
             if out:
@@ -312,7 +321,9 @@ def main():
                 "status": "alive"
             }
         )
+        logger.info("Heartbeat sent")
 
+        logger.info(f"Sleeping {CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
