@@ -14,6 +14,9 @@ import os
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
+TELEGRAM_CHAT_ID  = os.environ.get("TG_CHAT_ID")
+
 PORT = int(os.environ.get("PORT", "10000"))
 ENV  = os.environ.get("ENV", "render")
 
@@ -28,6 +31,9 @@ logger = logging.getLogger("deribit_vbi")
 BASE_URL = "https://www.deribit.com/api/v2"
 
 CURRENCIES = ["BTC", "ETH"]
+
+degraded_cycles = {s: 0 for s in CURRENCIES}
+degraded_alert_sent = {s: False for s in CURRENCIES}
 
 CHECK_INTERVAL = 600  # 10 min
 
@@ -299,6 +305,25 @@ def compute_vbi(currency):
         logger.exception(f"{currency}: compute failed")
         return degraded(currency, "exception")
 
+
+def send_telegram_alert(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram ENV not set, alert skipped")
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text
+            },
+            timeout=5
+        )
+        logger.warning("Telegram alert sent")
+    except Exception:
+        logger.exception("Telegram alert failed")
+
 # ===================== MAIN =====================
 
 def main():
@@ -312,6 +337,24 @@ def main():
             out = compute_vbi(c)
             if out:
                 send_to_db(EVENT_NAME, out)
+            
+                if out.get("status") == "degraded":
+                    degraded_cycles[c] += 1
+                    logger.warning(f"{c}: degraded cycle {degraded_cycles[c]}")
+            
+                    if degraded_cycles[c] >= 3 and not degraded_alert_sent[c]:
+                        send_telegram_alert(
+                            f"⚠️ {c} DEGRADED\n"
+                            f"cycles: {degraded_cycles[c]}\n"
+                            f"reason: {out.get('reason')}"
+                        )
+                        degraded_alert_sent[c] = True
+                else:
+                    if degraded_cycles[c] > 0:
+                        logger.info(f"{c}: recovered after {degraded_cycles[c]} degraded cycles")
+            
+                    degraded_cycles[c] = 0
+                    degraded_alert_sent[c] = False
 
         send_to_db(
             "deribit_vbi_heartbeat",
