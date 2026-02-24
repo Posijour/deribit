@@ -44,9 +44,9 @@ PATTERN_WINDOW = 3
 NEAR_IV_STABILITY = 0.02
 
 # --- ROLLING MATURITY WINDOWS (DAYS) ---
-NEAR_DTE_RANGE = (5, 10)
-MID_DTE_RANGE  = (20, 35)
-FAR_DTE_RANGE  = (60, 90)
+NEAR_DTE_RANGE = (3, 14)
+MID_DTE_RANGE  = (14, 45)
+FAR_DTE_RANGE  = (45, 120)
 
 # ===================== TIME =====================
 
@@ -94,7 +94,7 @@ def send_to_db(event, payload):
         )
         r.raise_for_status()
     except Exception:
-        pass
+        logger.exception("Supabase insert failed")
 
 # ===================== HTTP (HEALTH) =====================
 
@@ -199,100 +199,98 @@ near_iv_hist  = {s: deque(maxlen=PATTERN_WINDOW) for s in CURRENCIES}
 
 # ===================== VBI CORE =====================
 
-def compute_vbi(currency):
-    options = get_options(currency)
-    spot = get_index_price(currency)
-
-    exp1, exp2, exp3 = pick_rolling_expiries(options)
-    if not exp1 or not exp2 or not exp3:
-        return None
-
-    n_call = atm_option(options, exp1, "call", spot)
-    n_put  = atm_option(options, exp1, "put", spot)
-    m_call = atm_option(options, exp2, "call", spot)
-    f_call = atm_option(options, exp3, "call", spot)
-
-    if not n_call or not n_put or not m_call or not f_call:
-        return None
-
-    nc = get_book(n_call["instrument_name"])
-    np = get_book(n_put["instrument_name"])
-    mc = get_book(m_call["instrument_name"])
-    fc = get_book(f_call["instrument_name"])
-
-    if not nc or not np or not mc or not fc:
-        return None
-
-    near_iv = nc["mark_iv"]
-    mid_iv  = mc["mark_iv"]
-    far_iv  = fc["mark_iv"]
-
-    slope_1 = mid_iv - near_iv
-    slope_2 = far_iv - mid_iv
-    iv_slope = slope_1
-    curvature = slope_2 - slope_1
-
-    skew = np["mark_iv"] / nc["mark_iv"] if nc["mark_iv"] else None
-
-    score = 0
-    if iv_slope > IV_SLOPE_MEDIUM:
-        score += 40
-    if iv_slope > IV_SLOPE_STRONG:
-        score += 20
-
-    iv_slope_hist[currency].append(iv_slope)
-    near_iv_hist[currency].append(near_iv)
-
-    if len(near_iv_hist[currency]) >= PATTERN_WINDOW:
-        if near_iv > sum(near_iv_hist[currency]) / len(near_iv_hist[currency]):
-            score += 20
-
-    if skew is not None:
-        if abs(skew - 1.0) < SKEW_NEUTRAL_BAND:
-            score += 10
-        if abs(skew - 1.0) > SKEW_EXTREME_BAND:
-            score -= 10
-
-    score = max(0, min(score, 100))
-
-    if score < 30:
-        vbi_state = "COLD"
-    elif score <= 60:
-        vbi_state = "WARM"
-    else:
-        vbi_state = "HOT"
-
-    vbi_pattern = "NEUTRAL"
-    if len(iv_slope_hist[currency]) >= 3:
-        s = iv_slope_hist[currency]
-        n = near_iv_hist[currency]
-
-        if (
-            s[0] < s[1] < s[2] and
-            max(n) - min(n) < NEAR_IV_STABILITY * near_iv and
-            skew is not None and
-            abs(skew - 1.0) < SKEW_NEUTRAL_BAND and
-            curvature > 0
-        ):
-            vbi_pattern = "PRE_BREAK"
-
-        if iv_slope < -2.0 and curvature < 0 and near_iv < n[-2]:
-            vbi_pattern = "POST_EVENT"
-
+def degraded(currency, reason):
+    logger.warning(f"{currency}: degraded – {reason}")
     return {
         "ts_unix_ms": now_ts_ms(),
         "ts_iso_utc": now_iso_utc(),
         "symbol": currency,
-        "vbi_state": vbi_state,
-        "vbi_score": score,
-        "near_iv": round(near_iv, 2),
-        "mid_iv": round(mid_iv, 2),
-        "far_iv": round(far_iv, 2),
-        "iv_slope": round(iv_slope, 2),
-        "curvature": round(curvature, 2),
-        "skew": round(skew, 3) if skew else None,
-        "vbi_pattern": vbi_pattern
+        "status": "degraded",
+        "reason": reason,
+        "vbi_state": "DEGRADED",
+        "vbi_score": None
     }
+
+def compute_vbi(currency):
+    try:
+        options = get_options(currency)
+        spot = get_index_price(currency)
+
+        exp1, exp2, exp3 = pick_rolling_expiries(options)
+        if not exp1 or not exp2 or not exp3:
+            return degraded(currency, "no_expiries")
+
+        n_call = atm_option(options, exp1, "call", spot)
+        n_put  = atm_option(options, exp1, "put", spot)
+        m_call = atm_option(options, exp2, "call", spot)
+        f_call = atm_option(options, exp3, "call", spot)
+
+        if not n_call or not n_put or not m_call or not f_call:
+            return degraded(currency, "no_atm")
+
+        nc = get_book(n_call["instrument_name"])
+        np = get_book(n_put["instrument_name"])
+        mc = get_book(m_call["instrument_name"])
+        fc = get_book(f_call["instrument_name"])
+
+        if not nc or not np or not mc or not fc:
+            return degraded(currency, "no_book")
+
+        near_iv = nc["mark_iv"]
+        mid_iv  = mc["mark_iv"]
+        far_iv  = fc["mark_iv"]
+
+        if near_iv is None or mid_iv is None or far_iv is None:
+            return degraded(currency, "no_iv")
+
+        slope_1 = mid_iv - near_iv
+        slope_2 = far_iv - mid_iv
+        iv_slope = slope_1
+        curvature = slope_2 - slope_1
+
+        skew = np["mark_iv"] / nc["mark_iv"] if nc["mark_iv"] else None
+
+        score = 0
+        if iv_slope > IV_SLOPE_MEDIUM:
+            score += 40
+        if iv_slope > IV_SLOPE_STRONG:
+            score += 20
+
+        iv_slope_hist[currency].append(iv_slope)
+        near_iv_hist[currency].append(near_iv)
+
+        if len(near_iv_hist[currency]) >= PATTERN_WINDOW:
+            if near_iv > sum(near_iv_hist[currency]) / len(near_iv_hist[currency]):
+                score += 20
+
+        if skew is not None:
+            if abs(skew - 1.0) < SKEW_NEUTRAL_BAND:
+                score += 10
+            if abs(skew - 1.0) > SKEW_EXTREME_BAND:
+                score -= 10
+
+        score = max(0, min(score, 100))
+
+        vbi_state = "COLD" if score < 30 else "WARM" if score <= 60 else "HOT"
+
+        return {
+            "ts_unix_ms": now_ts_ms(),
+            "ts_iso_utc": now_iso_utc(),
+            "symbol": currency,
+            "status": "ok",
+            "vbi_state": vbi_state,
+            "vbi_score": score,
+            "near_iv": round(near_iv, 2),
+            "mid_iv": round(mid_iv, 2),
+            "far_iv": round(far_iv, 2),
+            "iv_slope": round(iv_slope, 2),
+            "curvature": round(curvature, 2),
+            "skew": round(skew, 3) if skew else None
+        }
+
+    except Exception:
+        logger.exception(f"{currency}: compute failed")
+        return degraded(currency, "exception")
 
 # ===================== MAIN =====================
 
@@ -302,12 +300,9 @@ def main():
 
     while True:
         for c in CURRENCIES:
-            try:
-                out = compute_vbi(c)
-                if out:
-                    send_to_db(EVENT_NAME, out)
-            except Exception:
-                pass
+            out = compute_vbi(c)
+            if out:
+                send_to_db(EVENT_NAME, out)
 
         send_to_db(
             "deribit_vbi_heartbeat",
