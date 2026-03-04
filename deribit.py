@@ -351,7 +351,7 @@ def main():
             
                     if degraded_cycles[c] >= 3 and not degraded_alert_sent[c]:
                         send_telegram_alert(
-                            f"⚠️ {c} DEGRADED\n"
+                            "⚠️ Deribit DEGRADED\n"
                             f"cycles: {degraded_cycles[c]}\n"
                             f"reason: {out.get('reason')}"
                         )
@@ -359,7 +359,9 @@ def main():
                 else:
                     if degraded_cycles[c] > 0:
                         logger.info(f"{c}: recovered after {degraded_cycles[c]} degraded cycles")
-            
+                        if degraded_alert_sent[c]:
+                            send_telegram_alert("✅ Deribit RECOVERED")
+
                     degraded_cycles[c] = 0
                     degraded_alert_sent[c] = False
 
