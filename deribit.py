@@ -78,7 +78,6 @@ def _sanitize_for_json(value):
 
 def send_to_db(event, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("Supabase ENV not set, skipping send")
         return
 
     try:
@@ -100,9 +99,8 @@ def send_to_db(event, payload):
             timeout=5
         )
         r.raise_for_status()
-        logger.info(f"Supabase OK → event={event} symbol={safe_payload['symbol']}")
     except Exception:
-        logger.exception("Supabase insert failed")
+        return
 
 # ===================== HTTP (HEALTH) =====================
 
@@ -122,7 +120,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 def run_http_server():
-    logger.info(f"HTTP health server listening on {PORT}")
     HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 # ===================== DERIBIT API =====================
@@ -140,10 +137,9 @@ def get_json(method, params=None, retries=3):
             if "error" in j:
                 raise Exception(j["error"])
             return j["result"]
-        except Exception as e:
+        except Exception:
             if attempt == retries - 1:
                 raise
-            logger.warning(f"Deribit retry {attempt+1} for {method}: {e}")
             time.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
 
 def get_index_price(currency):
@@ -222,8 +218,6 @@ def degraded(currency, reason):
     }
 
 def compute_vbi(currency):
-    logger.info(f"{currency}: compute start")
-
     try:
         options = get_options(currency)
         spot = get_index_price(currency)
@@ -262,13 +256,6 @@ def compute_vbi(currency):
 
         skew = np["mark_iv"] / nc["mark_iv"] if nc["mark_iv"] else None
 
-        logger.info(
-            f"{currency}: near_iv={near_iv:.4f} "
-            f"mid_iv={mid_iv:.4f} "
-            f"far_iv={far_iv:.4f} "
-            f"iv_slope={iv_slope:.4f} "
-            f"skew={skew}"
-        )
         score = 0
         if iv_slope > IV_SLOPE_MEDIUM:
             score += 40
@@ -291,8 +278,6 @@ def compute_vbi(currency):
         score = max(0, min(score, 100))
         vbi_state = "COLD" if score < 30 else "WARM" if score <= 60 else "HOT"
 
-        logger.info(f"{currency}: compute OK state={vbi_state} score={score}")
-
         return {
             "ts_unix_ms": now_ts_ms(),
             "ts_iso_utc": now_iso_utc(),
@@ -309,13 +294,11 @@ def compute_vbi(currency):
         }
 
     except Exception:
-        logger.exception(f"{currency}: compute failed")
         return degraded(currency, "exception")
 
 
 def send_telegram_alert(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram ENV not set, alert skipped")
         return
 
     try:
@@ -327,9 +310,8 @@ def send_telegram_alert(text):
             },
             timeout=5
         )
-        logger.warning("Telegram alert sent")
     except Exception:
-        logger.exception("Telegram alert failed")
+        return
 
 # ===================== MAIN =====================
 
@@ -338,8 +320,6 @@ def main():
     logger.info("Starting Deribit VBI service")
 
     while True:
-        logger.info("=== VBI cycle start ===")
-
         for c in CURRENCIES:
             out = compute_vbi(c)
             if out:
@@ -374,8 +354,6 @@ def main():
             }
         )
         logger.info("Heartbeat sent")
-
-        logger.info(f"Sleeping {CHECK_INTERVAL}s")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
